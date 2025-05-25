@@ -237,13 +237,31 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 void reconnectWiFi() {
   if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
     Serial.println("WiFi disconnected, reconnecting...");
-    WiFi.reconnect();
+    WiFi.disconnect(true); // Force disconnect
+    delay(100); // Brief pause to clear buffers
+    WiFi.begin(ssid, password);
     unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
-      delay(500);
+    const unsigned long RECONNECT_TIMEOUT = 30000; // 30s timeout
+    int retryCount = 0;
+    const int MAX_RETRIES = 3;
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < RECONNECT_TIMEOUT) {
+      delay(100); // Reduced for responsiveness
       Serial.print(".");
     }
-    Serial.println(WiFi.status() == WL_CONNECTED ? "\nReconnected, IP: " + WiFi.localIP().toString() : "\nFailed to reconnect");
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nReconnected, IP: " + WiFi.localIP().toString());
+    } else {
+      Serial.println("\nFailed to reconnect, retry: " + String(retryCount + 1));
+      retryCount++;
+      if (retryCount >= MAX_RETRIES) {
+        Serial.println("Max retries reached, resetting Wi-Fi module...");
+        WiFi.mode(WIFI_OFF); // Turn off Wi-Fi
+        delay(1000);
+        WiFi.mode(WIFI_STA); // Restart in station mode
+        WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS); // Reapply static IP
+        WiFi.begin(ssid, password);
+      }
+    }
     lastWiFiCheck = millis();
   }
 }
@@ -378,8 +396,14 @@ void loop() {
 
   // Update clients
   static unsigned long lastUpdate = 0;
-  unsigned long updateInterval = (ws.count() > 0) ? 1000 : 2000;
+  unsigned long updateInterval = (ws.count() > 0) ? 1000 : 5000; // Slower updates when no clients
   if (millis() - lastUpdate >= updateInterval) {
+    // Log heap and RSSI for debugging
+    Serial.print("Free heap: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print(", WiFi RSSI: ");
+    Serial.println(WiFi.RSSI());
+
     String timerStr = "--:--";
     if (heaterOn) {
       unsigned long elapsed = millis() - startMillis;
@@ -418,7 +442,21 @@ void loop() {
 
   // Watchdog
   if (millis() - lastAliveMillis > ALIVE_TIMEOUT) {
-    Serial.println("Watchdog triggered, restarting...");
-    ESP.restart();
+    Serial.println("Watchdog triggered. WiFi status: " + String(WiFi.status()) + ", Free heap: " + String(ESP.getFreeHeap()));
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Attempting Wi-Fi reset before restart...");
+      WiFi.mode(WIFI_OFF);
+      delay(1000);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(ssid, password);
+      delay(5000); // Give 5s to reconnect
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Wi-Fi reset failed, restarting ESP...");
+      ESP.restart();
+    } else {
+      Serial.println("Wi-Fi reconnected, canceling restart");
+      lastAliveMillis = millis();
+    }
   }
 }
