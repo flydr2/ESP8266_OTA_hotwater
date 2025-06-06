@@ -1,58 +1,69 @@
+#include <AsyncEventSource.h>
+#include <AsyncJson.h>
+#include <AsyncWebSocket.h>
+#include <AsyncWebSynchronization.h>
+#include <ESPAsyncWebServer.h>
+#include <StringArray.h>
+#include <WebAuthentication.h>
+#include <WebHandlerImpl.h>
+#include <WebResponseImpl.h>
+
 /*
- * Boat Hot Water Heater Controller for ESP8266
- * Controls a water heater relay based on DS18B20 temperature sensor readings.
- * Provides a web interface to set temperature and start/stop the heater.
- * Supports Over-The-Air (OTA) updates and Tailscale via Nginx reverse proxy.
- * 
- * Fix: Start button works over Tailscale/Nginx but not locally.
- * Solution: Dynamically set WebSocket and HTTP paths based on URL (/HotWater/ for Nginx, / for local).
- * 
- * Features:
- * - Web interface with slider (20-39°C) and Start/Stop button.
- * - WebSocket for real-time temperature, status, and timer updates.
- * - 30-minute timeout to save energy.
- * - Watchdog for reliability.
- * - OTA updates via ArduinoOTA.
- * - Debug logging for Tailscale/Nginx issues.
- * 
- * Hardware:
- * - ESP8266 (e.g., NodeMCU) with 1MB+ flash.
- * - DS18B20 on D2 (4.7k pull-up to 3.3V).
- * - Relay on D4 (active LOW, normally open).
- * 
- * Setup:
- * - change the "oatpassword" to yours
- * - Update ssid, password, and ota_password.
- * - Initial upload via USB to enable OTA.
- * - Access locally: http://192.168.1.184/ this is my address change to yours in the IP config area
- * - Access via Tailscale: http://<nginx-tailscale-ip>/HotWater/
- * - Uncomment heaterOn = false in loop() to keep heater OFF after setpoint.
- * 
- * Debugging:
- * - Serial Monitor (115200 baud) for HTTP/WebSocket logs.
- * - Browser console (F12 > Console) for client-side errors.
- * - Test Start button and slider on local and Tailscale networks.
- */
+   Boat Hot Water Heater Controller for ESP8266
+   Controls a water heater relay based on DS18B20 temperature sensor readings.
+   Provides a web interface to set temperature and start/stop the heater.
+   Supports Over-The-Air (OTA) updates and Tailscale via Nginx reverse proxy.
+
+   Fix: Start button works over Tailscale/Nginx but not locally.
+   Solution: Dynamically set WebSocket and HTTP paths based on URL (/HotWater/ for Nginx, / for local).
+
+   Features:
+   - Web interface with slider (20-39°C) and Start/Stop button.
+   - WebSocket for real-time temperature, status, and timer updates.
+   - 30-minute timeout to save energy.
+   - Watchdog for reliability.
+   - OTA updates via ArduinoOTA.
+   - Debug logging for Tailscale/Nginx issues.
+
+   Hardware:
+   - ESP8266 (e.g., NodeMCU) with 1MB+ flash.
+   - DS18B20 on D2 (4.7k pull-up to 3.3V).
+   - Relay on D4 (active LOW, normally open).
+
+   Setup:
+   - change the "oatpassword" to yours
+   - Update ssid, password, and ota_password.
+   - Initial upload via USB to enable OTA.
+   - Access locally: http://192.168.1.184/ this is my address change to yours in the IP config area
+   - Access via Tailscale: http://<nginx-tailscale-ip>/HotWater/
+   - Uncomment heaterOn = false in loop() to keep heater OFF after setpoint.
+
+   Debugging:
+   - Serial Monitor (115200 baud) for HTTP/WebSocket logs.
+   - Browser console (F12 > Console) for client-side errors.
+   - Test Start button and slider on local and Tailscale networks.
+   - Chaged from Dallas to DS18B20 temperature library (Was having issues which hopefully this cures)
+*/
 
 // Libraries
 #include <ESP8266WiFi.h>        // Wi-Fi functionality
 #include <ESPAsyncTCP.h>        // Async TCP for web server
 #include <ESPAsyncWebServer.h>  // Async HTTP and WebSocket server
-#include <OneWire.h>            // DS18B20 communication
-#include <DallasTemperature.h>  // DS18B20 temperature readings
+#include <OneWire.h>            // OneWire for DS18B20 communication
+#include <DS18B20.h>            // DS18B20 temperature readings
 #include <ArduinoOTA.h>         // OTA updates
 
 // Network credentials
-const char* ssid = "ssid";      // Wi-Fi SSID
-const char* password = "password";   // Wi-Fi password
+const char* ssid = "Sailrover2G";      // Wi-Fi SSID
+const char* password = "robitaille";   // Wi-Fi password
 
 // Pin definitions
 const int switch1 = 2;        // D4, relay (active LOW)
 const int oneWireBus = 4;     // D2, DS18B20 (4.7k pull-up)
 
 // DS18B20 setup
-OneWire oneWire(oneWireBus);
-DallasTemperature sensors(&oneWire);
+OneWire oneWire(oneWireBus);  // Initialize OneWire on pin D2
+DS18B20 sensor(&oneWire);     // Initialize DS18B20 with OneWire object
 
 // Static IP configuration
 IPAddress local_IP(192, 168, 1, 184);  // ESP8266 IP
@@ -78,9 +89,10 @@ const char* PARAM_INPUT = "value";         // Slider param
 const char* PARAM_ACTION = "action";       // Toggle param
 unsigned long lastWiFiCheck = 0;           // Wi-Fi check timer
 const unsigned long WIFI_CHECK_INTERVAL = 10000; // Check Wi-Fi every 10s
+const unsigned long RESET_INTERVAL = 1800000; // 1/2 hour in milliseconds (adjustable)
 
 // OTA configuration
-const char* ota_password = "oatpassword"; // Change to secure password
+const char* ota_password = "robitaille"; // Change to secure password
 
 // HTML webpage
 const char index_html[] PROGMEM = R"rawliteral(
@@ -106,7 +118,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   <h2>Calientador</h2>
   <p>Temp. Presente: <span id="currentTemp">0</span> C</p>
   <p>Temp. Quiero: <span id="textSliderValue">%SETPOINTTEMP%</span> C</p>
-  <p><input type="range" onchange="updateSlider(this)" id="tempSlider" min="20" max="39" value="%SETPOINTTEMP%" step="1" class="slider"></p>
+  <p><input type="range" onchange="updateSlider(this)" id="tempSlider" min="29" max="39" value="%SETPOINTTEMP%" step="1" class="slider"></p>
   <p>Status: <span id="tankStatus">%TANKSTATUS%</span></p>
   <p>Queda Tiempo: <span id="timeRemaining">--:--</span></p>
   <p><button id="controlButton" class="button button-off" onclick="toggleHeater()">Start</button></p>
@@ -233,6 +245,25 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
   }
 }
 
+void checkPeriodicReset() {
+  static unsigned long lastResetMillis = 0;
+
+  
+  if (!heaterOn) { // Timer not running (no heating cycle)
+    if (millis() - lastResetMillis >= RESET_INTERVAL) {
+      Serial.println("Periodic reset triggered: Timer not running.");
+      digitalWrite(switch1, LOW); // Ensure heater is off
+      delay(100); // Brief pause for Serial
+      ESP.restart(); // Reset ESP8266
+      lastResetMillis = millis(); // Update after reset (won’t execute due to restart)
+    }
+  } else {
+    lastResetMillis = millis(); // Reset timer if heating to align with idle periods
+  }
+}
+
+
+
 // Reconnect Wi-Fi
 void reconnectWiFi() {
   if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
@@ -271,7 +302,8 @@ void setup() {
   Serial.begin(115200);
   pinMode(switch1, OUTPUT);
   digitalWrite(switch1, LOW); // Heater OFF
-  sensors.begin();
+  sensor.begin(); // Initialize DS18B20 sensor
+//sensors.setWaitForConversion(false);
 
   // Configure static IP
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
@@ -365,8 +397,10 @@ void loop() {
   reconnectWiFi();
 
   // Read temperature
-  sensors.requestTemperatures();
-  currentTemp = sensors.getTempCByIndex(0);
+  sensor.requestTemperatures(); // Request temperature conversion
+  delay(750);                  // Wait for conversion (12-bit resolution)
+  currentTemp = sensor.getTempC(); // Read temperature in Celsius
+
 
   // Validate temperature
   if (currentTemp == -127.0 || currentTemp == 85.0) {
@@ -459,4 +493,5 @@ void loop() {
       lastAliveMillis = millis();
     }
   }
+  checkPeriodicReset();//to stop the freezing periodic bug
 }
